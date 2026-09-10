@@ -66,16 +66,21 @@
     max-width: 880px; font-weight: 500;
   }
   .sub b { color: var(--text); font-weight: 700; }
-  .bottom { position: relative; z-index: 1; display: flex; align-items: center; justify-content: space-between; }
-  .pills { display: flex; gap: 14px; }
+  /* Nothing in this row may wrap or shrink. Without flex:none + nowrap the
+     pills and the repo line both reflowed onto two lines and overlapped —
+     visible as soon as the repo slug got longer. */
+  .bottom { position: relative; z-index: 1; display: flex; align-items: center;
+            justify-content: space-between; gap: 24px; }
+  .pills { display: flex; gap: 14px; flex: none; }
   .pill {
-    display: flex; align-items: center; gap: 9px;
-    font-size: 21px; font-weight: 700; color: var(--text);
+    display: flex; align-items: center; gap: 9px; flex: none; white-space: nowrap;
+    font-size: 20px; font-weight: 700; color: var(--text);
     background: rgba(255,255,255,.04); border: 1.5px solid var(--line);
-    border-radius: 12px; padding: 12px 20px;
+    border-radius: 12px; padding: 12px 18px;
   }
   .dot { width: 11px; height: 11px; border-radius: 50%; }
-  .repo { font-size: 22px; color: var(--muted); font-weight: 600; }
+  .repo { font-size: 21px; color: var(--muted); font-weight: 600;
+          flex: none; white-space: nowrap; }
   .repo b { color: var(--text); }
 </style>
 </head>
@@ -109,7 +114,7 @@
         <span class="pill"><span class="dot" style="background:var(--amber)"></span>Live coherence meter</span>
         <span class="pill"><span class="dot" style="background:var(--blue)"></span>Python + React</span>
       </div>
-      <div class="repo">github.com/<b>champion19007/qwerty-studio</b></div>
+      <div class="repo"><b>champion19007/qwerty-studio</b></div>
     </div>
   </div>
 </body>
