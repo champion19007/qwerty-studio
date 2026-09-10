@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QWERTY Studio — self-hosted anti-detect browser &amp; profile manager</title>
+<meta name="description" content="Open-source, self-hosted anti-detect browser and profile manager. Coherent browser fingerprints, per-profile proxies and persistent sessions, driven from a web console or CLI.">
+<link rel="canonical" href="https://champion19007.github.io/qwerty-studio/">
+
+<!-- Social cards reuse the same image as the repo's GitHub preview. -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="QWERTY Studio — self-hosted anti-detect browser">
+<meta property="og:description" content="Coherent fingerprints, per-profile proxies &amp; sessions — a free, local alternative to Multilogin, GoLogin &amp; AdsPower.">
+<meta property="og:url" content="https://champion19007.github.io/qwerty-studio/">
+<meta property="og:image" content="https://champion19007.github.io/qwerty-studio/social-preview.png">
+<meta name="twitter:card" content="summary_large_image">
+
+<style>
+  /* Palette shared with docs/social-preview.html so the site, the social card
+     and the dashboard all read as one product. */
+  :root {
+    --ink:    #0b0f17;
+    --ink-2:  #111725;
+    --line:   #1f2836;
+    --text:   #e8edf5;
+    --muted:  #8a97ab;
+    --amber:  #f5b53d;
+    --green:  #3ddc84;
+    --blue:   #61dafb;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    background: var(--ink); color: var(--text); line-height: 1.6;
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--amber); }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+
+  /* ---- hero ---- */
+  header {
+    position: relative; overflow: hidden;
+    border-bottom: 1px solid var(--line);
+    background:
+      radial-gradient(900px 420px at 12% -10%, rgba(245,181,61,.13), transparent 60%),
+      radial-gradient(700px 380px at 88% 0%, rgba(97,218,251,.08), transparent 60%),
+      linear-gradient(180deg, var(--ink-2), var(--ink));
+  }
+  .hero { padding: 68px 0 60px; }
+  .brandrow { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .logo {
+    width: 54px; height: 54px; border-radius: 14px; flex: none;
+    display: grid; place-items: center;
+    background: linear-gradient(150deg, #f7c455, var(--amber));
+    box-shadow: 0 0 0 1px rgba(255,255,255,.08), 0 14px 36px rgba(245,181,61,.22);
+  }
+  .logo svg { width: 30px; height: 30px; }
+  .brand { font-size: 27px; font-weight: 800; letter-spacing: -.4px; }
+  .brand span { color: var(--muted); font-weight: 600; }
+  .tag {
+    font-size: 12px; font-weight: 800; letter-spacing: 1.1px; color: var(--amber);
+    border: 1.5px solid rgba(245,181,61,.4); border-radius: 999px; padding: 5px 12px;
+  }
+  h1 {
+    margin-top: 30px; font-size: clamp(34px, 6vw, 54px); line-height: 1.06;
+    font-weight: 800; letter-spacing: -1.4px; max-width: 17ch;
+  }
+  h1 em { color: var(--amber); font-style: normal; }
+  .sub {
+    margin-top: 20px; font-size: clamp(17px, 2.4vw, 21px); color: var(--muted);
+    max-width: 62ch;
+  }
+  .sub b { color: var(--text); font-weight: 700; }
+  .cta { margin-top: 34px; display: flex; gap: 12px; flex-wrap: wrap; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 9px; text-decoration: none;
+    font-weight: 700; font-size: 15px; padding: 13px 22px; border-radius: 11px;
+    border: 1.5px solid var(--line); color: var(--text);
+    background: rgba(255,255,255,.04); transition: border-color .15s, background .15s;
+  }
+  .btn:hover { border-color: #33405a; background: rgba(255,255,255,.07); }
+  .btn.primary {
+    background: linear-gradient(150deg, #f7c455, var(--amber));
+    color: #0b0f17; border-color: transparent;
+  }
+  .btn.primary:hover { filter: brightness(1.06); background: var(--amber); }
+  .btn svg { width: 17px; height: 17px; }
+
+  /* ---- sections ---- */
+  section { padding: 62px 0; border-bottom: 1px solid var(--line); }
+  h2 {
+    font-size: 13px; font-weight: 800; letter-spacing: 1.4px; color: var(--muted);
+    text-transform: uppercase; margin-bottom: 22px;
+  }
+  h3 { font-size: 21px; font-weight: 700; letter-spacing: -.3px; margin-bottom: 8px; }
+  p { color: var(--muted); max-width: 68ch; }
+  p + p { margin-top: 14px; }
+  p b, li b { color: var(--text); font-weight: 700; }
+  code {
+    font-family: var(--mono); font-size: .92em; color: var(--text);
+    background: rgba(255,255,255,.06); border-radius: 5px; padding: 2px 6px;
+  }
+  pre {
+    margin-top: 16px; background: #070a11; border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px 20px; overflow-x: auto;
+  }
+  pre code {
+    background: none; padding: 0; font-size: 13.5px; line-height: 1.85;
+    color: var(--text); white-space: pre;
+  }
+  pre .c { color: #5d6b83; }        /* comment */
+  pre .p { color: var(--green); }   /* prompt */
+
+  .grid { display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); }
+  .card {
+    background: rgba(255,255,255,.03); border: 1px solid var(--line);
+    border-radius: 14px; padding: 22px;
+  }
+  .card p { font-size: 15px; max-width: none; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 9px; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 15px; }
+  th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-size: 12px; letter-spacing: .8px; text-transform: uppercase; }
+  td:first-child { color: var(--text); font-weight: 700; white-space: nowrap; }
+  td { color: var(--muted); }
+  .tablewrap { overflow-x: auto; }
+
+  .note {
+    margin-top: 22px; border-left: 3px solid var(--amber);
+    background: rgba(245,181,61,.06); border-radius: 0 10px 10px 0; padding: 16px 20px;
+  }
+  .note p { color: #cdd6e4; font-size: 15px; }
+
+  ul { margin-top: 12px; padding-left: 22px; color: var(--muted); }
+  li { margin-bottom: 8px; }
+
+  footer { padding: 46px 0 64px; }
+  footer p { font-size: 14px; }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap hero">
+    <div class="brandrow">
+      <div class="logo">
+        <svg viewBox="0 0 24 24" fill="none" stroke="#0b0f17" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M2 12C2 6.5 6.5 2 12 2a10 10 0 0 1 8 4"/>
+          <path d="M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2"/>
+          <path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/>
+          <path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/>
+          <path d="M8.65 22c.21-.66.45-1.32.57-2"/>
+          <path d="M14 13.12c0 2.38 0 6.38-1 8.88"/>
+          <path d="M2 16h.01"/><path d="M21.8 16c.2-2 .131-5.354 0-6"/>
+          <path d="M9 6.8a6 6 0 0 1 9 5.2v2"/>
+        </svg>
+      </div>
+      <div class="brand">QWERTY <span>Studio</span></div>
+      <span class="tag">OPEN SOURCE</span>
+    </div>
+
+    <h1>The self-hosted <em>anti-detect browser</em></h1>
+    <p class="sub">
+      Browser profiles that each look like a real, separate device — a coherent
+      fingerprint, its own proxy, and a persistent session — managed from a clean
+      web console or the CLI. A <b>free, local</b> alternative to Multilogin,
+      GoLogin and AdsPower.
+    </p>
+
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/champion19007/qwerty-studio">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82a7.4 7.4 0 0 1 2-.27c.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A7.99 7.99 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        View on GitHub
+      </a>
+      <a class="btn" href="#quick-start">Quick start</a>
+      <a class="btn" href="https://github.com/champion19007/qwerty-studio/blob/main/docs/architecture.md">Architecture</a>
+    </div>
+  </div>
+</header>
+
+<section id="why">
+  <div class="wrap">
+    <h2>Why it exists</h2>
+    <h3>Coherence, not randomness</h3>
+    <p>
+      Most fingerprint tools randomise each value on its own — and that is exactly
+      what gets them caught. Anti-bot systems don't read values in isolation, they
+      <b>cross-check</b> them. A macOS user-agent with an NVIDIA GPU, or a 4-core
+      phone claiming a 1440p screen, is an instant tell.
+    </p>
+    <p>
+      QWERTY picks a realistic <b>device archetype</b> first, then draws every
+      value — OS, user-agent, GPU, screen, CPU, RAM, timezone, language — from
+      that archetype's real-world pool. The result is an identity whose parts all
+      agree, plus a live coherence check that proves it: <code>validate()</code>
+      in the engine, and a real-time meter in the dashboard.
+    </p>
+  </div>
+</section>
+
+<section id="quick-start">
+  <div class="wrap">
+    <h2>Quick start</h2>
+    <p>Python 3.9+ for the engine, Node 18+ for the dashboard. The two halves are
+       independent — run either, or both.</p>
+    <pre><code><span class="c"># 1. get it</span>
+<span class="p">$</span> git clone https://github.com/champion19007/qwerty-studio.git
+<span class="p">$</span> cd qwerty-studio/engine
+
+<span class="c"># 2. install the engine and a browser to drive</span>
+<span class="p">$</span> pip install -e ".[launch]"
+<span class="p">$</span> playwright install chromium
+
+<span class="c"># 3. make an identity and open it</span>
+<span class="p">$</span> qwerty create acct-01 --os windows --locale en-US
+<span class="p">$</span> qwerty launch acct-01
+
+<span class="c"># 4. optional: the web console (needs the api extra)</span>
+<span class="p">$</span> pip install -e ".[api]" &amp;&amp; qwerty serve
+<span class="p">$</span> cd ../dashboard &amp;&amp; npm install &amp;&amp; npm run dev</code></pre>
+    <p style="margin-top:16px">
+      On Windows, <code>start.bat</code> installs everything and starts both halves
+      in one double-click. The dashboard also runs standalone on sample data, so
+      you can look around before installing the engine.
+    </p>
+  </div>
+</section>
+
+<section id="what">
+  <div class="wrap">
+    <h2>What's in it</h2>
+    <div class="grid">
+      <div class="card">
+        <h3><span class="dot" style="background:var(--amber)"></span>Coherent identities</h3>
+        <p>Desktop and Android fingerprints drawn as one device, so the model in
+           the user-agent is the phone whose GPU, screen and RAM it reports.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--green)"></span>Trust checker</h3>
+        <p>Grades the <b>real browser</b>, not the config — 16 checks a
+           fingerprinter would actually run, plus one-click auto-adjust.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--blue)"></span>Proxies &amp; leaks</h3>
+        <p>A managed pool with health checks, WebRTC and DNS leak tests, and a
+           TLS/JA3 reader for the layer JavaScript can't touch.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--amber)"></span>Sessions that last</h3>
+        <p>Cookies and localStorage persist between launches. Import or export a
+           logged-in session as Cookie-Editor JSON, Playwright state or
+           <code>cookies.txt</code>.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--green)"></span>Collision detector</h3>
+        <p>Finds profiles that share a fingerprint before a site links the
+           accounts — the failure mode that quietly defeats the whole setup.</p>
+      </div>
+      <div class="card">
+        <h3><span class="dot" style="background:var(--blue)"></span>Drive it yourself</h3>
+        <p>Attach Selenium, Puppeteer or Playwright to a live profile over CDP,
+           so your automation inherits the identity rather than replacing it.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="engines">
+  <div class="wrap">
+    <h2>Pluggable stealth engines</h2>
+    <p>QWERTY's job is to be the <b>manager</b> — identities, proxies, sessions,
+       folders, coherence. The browser underneath is a backend you pick per profile.</p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Engine</th><th>What it is</th></tr></thead>
+        <tbody>
+          <tr><td>cloak</td><td>CloakBrowser — patched Chromium, C++-level fingerprint/TLS/CDP changes. Recommended.</td></tr>
+          <tr><td>camoufox</td><td>Patched Firefox with its own coherent fingerprint generator.</td></tr>
+          <tr><td>patchright</td><td>Runtime-patched Playwright; fixes <code>webdriver</code>/CDP leaks the stock engine can't.</td></tr>
+          <tr><td>playwright</td><td>Always available. Stock Chromium plus an injected stealth script.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <p><b>Being honest about limits.</b> Pure JavaScript injection has a ceiling —
+      it cannot change the TLS/JA3 fingerprint or hide the CDP transport. For
+      Cloudflare / DataDome-grade targets, pair a patched engine with a residential
+      proxy and a warmed-up session. QWERTY stays the same manager over all of them.</p>
+    </div>
+  </div>
+</section>
+
+<section id="use">
+  <div class="wrap">
+    <h2>Legitimate use</h2>
+    <p>
+      QWERTY is a tool for multi-account management done openly: agencies running
+      many client ad accounts, QA and ad-verification testing, web-automation
+      development, and privacy research — the same work commercial anti-detect
+      browsers are sold for.
+    </p>
+    <p>
+      Do <b>not</b> use it for fraud, credential stuffing, spam, evading bans you
+      have earned, or anything that breaks a site's terms or the law. You are
+      responsible for how you use it.
+    </p>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>
+      MIT licensed ·
+      <a href="https://github.com/champion19007/qwerty-studio">champion19007/qwerty-studio</a> ·
+      <a href="https://github.com/champion19007/qwerty-studio/issues">Issues</a> ·
+      <a href="https://github.com/champion19007/qwerty-studio/blob/main/CONTRIBUTING.md">Contributing</a> ·
+      <a href="https://github.com/champion19007/qwerty-studio/blob/main/SECURITY.md">Security</a>
+    </p>
+  </div>
+</footer>
+
+</body>
+</html>
