@@ -1,0 +1,1283 @@
+"""
+HTTP API for the dashboard.
+
+The React dashboard is a thin front-end; this module is the bridge that lets it
+drive the *real* engine. It wraps :class:`ProfileStore`, the fingerprint
+generator/validator and the launcher behind a small JSON API, and it manages the
+lifecycle of launched browsers.
+
+Design notes
+------------
+* The dashboard has a richer profile shape than the engine (folders, per-signal
+  spoof modes, media counts, …). To keep the UI lossless we store the dashboard
+  profile JSON as-is in ``<data-dir>/dashboard`` and only convert to an engine
+  :class:`Fingerprint`/:class:`Profile` at launch time.
+* Launching runs ``qwerty launch <id>`` as a subprocess. That sidesteps the
+  hazards of driving Playwright's sync API from inside an async web server, and
+  makes "stop" a clean process terminate. A profile is "running" as long as its
+  subprocess is alive.
+
+Run it with:  ``qwerty serve``  (see ``cli.py``).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import random
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+from pathlib import Path
+from typing import Optional
+
+from . import cookies as cookies_mod
+from . import devices
+from .fingerprint import build_user_agent, generate, validate
+from .models import Fingerprint, Profile, Proxy
+from .store import ProfileStore
+
+log = logging.getLogger("qwerty.server")
+
+
+def _require_fastapi():
+    try:
+        import fastapi  # noqa: F401
+        import uvicorn  # noqa: F401
+    except ImportError as e:  # pragma: no cover - environment dependent
+        raise RuntimeError(
+            "The API server needs FastAPI and Uvicorn.\n"
+            'Install them with:  pip install -e ".[api]"'
+        ) from e
+
+
+# --------------------------------------------------------------------------
+# OS name mapping between the dashboard ("Windows") and engine ("windows").
+# --------------------------------------------------------------------------
+OS_TO_ENGINE = {"Windows": "windows", "macOS": "macos", "Linux": "linux", "Android": "android"}
+OS_TO_DASH = {v: k for k, v in OS_TO_ENGINE.items()}
+
+
+# --------------------------------------------------------------------------
+# Dashboard profile shape.
+#
+# The dashboard stores its own richer profile dict verbatim, which keeps the UI
+# lossless — but it also meant POST/PUT /api/profiles saved whatever they were
+# handed. A client that omitted a field (another script, an older export, a
+# hand-edited file) produced a profile the React app could not render: it does
+# `p.tags.map(...)`, so a missing `tags` threw and, with no error boundary,
+# blanked the entire application. Normalising here is the root fix — every
+# stored profile carries every field the UI needs.
+# --------------------------------------------------------------------------
+DASHBOARD_DEFAULTS: dict = {
+    # NB: not "All profiles" — that string is the dashboard's "show everything"
+    # sentinel, not a folder. Storing it makes the sidebar list a phantom
+    # duplicate folder alongside the real view.
+    "name": "", "folder": "Unsorted", "status": "stopped", "os": "Windows",
+    "tags": [], "browser": "Chrome", "browserVersion": "128.0.0.0",
+    "canvas": "Noise", "webrtc": "Altered", "audio": "Noise", "fonts": "Masked",
+    "geo": "Prompt", "locale": "en-US", "timezone": "America/New_York",
+    "screen": "1920x1080", "cores": 8, "memory": 8,
+    "webglVendor": "", "webglRenderer": "", "userAgent": "",
+    "mediaVideo": 1, "mediaAudio": 1, "dnt": False,
+    "proxy": None, "notes": "", "startupUrls": "", "extensions": "",
+    "lastActive": "never",
+}
+# Fields the UI iterates over, so they must be lists whatever a client sent.
+DASHBOARD_LIST_FIELDS = ("tags",)
+# The only field where None is a real value: it means "go direct, no proxy".
+# Everywhere else a null is just a missing value wearing a disguise.
+DASHBOARD_NULLABLE = ("proxy",)
+
+
+def normalize_dashboard_profile(profile: dict) -> dict:
+    """Fill in every field the dashboard UI assumes exists, with the right type.
+
+    A caller's value wins whenever it is usable, so this stays lossless for the
+    dashboard's own round-trips. Missing keys, explicit nulls (except ``proxy``,
+    where null means "direct") and wrong types all fall back to the default —
+    the UI does ``p.tags.map(...)`` and ``p.browserVersion.split(...)``, so a
+    single bad value used to throw during render and blank the whole app.
+    """
+    out = dict(profile or {})
+    for key, default in DASHBOARD_DEFAULTS.items():
+        missing = key not in out
+        nulled = out.get(key) is None and key not in DASHBOARD_NULLABLE
+        if missing or nulled:
+            out[key] = list(default) if isinstance(default, list) else default
+    for key in DASHBOARD_LIST_FIELDS:
+        if not isinstance(out.get(key), list):
+            out[key] = []
+    # `proxy` is read as a mapping (px.get("host")) at launch, so anything that
+    # isn't a dict has to become None rather than reaching to_engine_profile.
+    if out.get("proxy") is not None and not isinstance(out["proxy"], dict):
+        out["proxy"] = None
+    # A user-agent that agrees with the OS is better than an empty string, which
+    # would launch a browser with no UA at all.
+    if not out.get("userAgent"):
+        os_key = OS_TO_ENGINE.get(out.get("os", "Windows"), "windows")
+        out["userAgent"] = build_user_agent(os_key, out.get("browserVersion") or "128.0.0.0")
+    return out
+
+
+class DashboardStore:
+    """Persists dashboard-shaped profile dicts, one JSON file per profile."""
+
+    def __init__(self, root: Path):
+        self.dir = root / "dashboard"
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def _path(self, pid: str) -> Path:
+        return self.dir / f"{pid}.json"
+
+    def list(self) -> list[dict]:
+        """Every readable profile, normalised. A file that can't be parsed at all
+        is skipped rather than breaking the whole listing."""
+        out = []
+        for f in sorted(self.dir.glob("*.json")):
+            try:
+                out.append(normalize_dashboard_profile(json.loads(f.read_text(encoding="utf-8"))))
+            except (json.JSONDecodeError, OSError, TypeError, AttributeError):
+                continue
+        return sorted(out, key=lambda p: p.get("_created", 0))
+
+    def get(self, pid: str) -> Optional[dict]:
+        f = self._path(pid)
+        if not f.exists():
+            return None
+        # Normalised on read too, so profiles written before this existed (or by
+        # an older version) still render.
+        return normalize_dashboard_profile(json.loads(f.read_text(encoding="utf-8")))
+
+    def save(self, prof: dict) -> dict:
+        if not prof.get("id"):
+            prof["id"] = uuid.uuid4().hex[:12]
+        prof.setdefault("_created", time.time())
+        self._path(prof["id"]).write_text(json.dumps(prof, indent=2), encoding="utf-8")
+        return prof
+
+    def delete(self, pid: str) -> bool:
+        f = self._path(pid)
+        if not f.exists():
+            return False
+        f.unlink()
+        return True
+
+    # Dashboard-only settings (folder list, etc.) live in a sibling file rather
+    # than inside the dashboard/ dir, so list()'s "*.json" glob never mistakes
+    # them for a profile.
+    def _meta_path(self) -> Path:
+        return self.dir.parent / "dashboard-config.json"
+
+    def get_meta(self) -> dict:
+        f = self._meta_path()
+        if not f.exists():
+            return {}
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+
+    def set_meta(self, meta: dict) -> dict:
+        self._meta_path().write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        return meta
+
+
+class ProxyPool:
+    """A managed list of proxies the dashboard can import, test and assign."""
+
+    def __init__(self, root: Path):
+        self.path = root / "proxies.json"
+
+    def list(self) -> list[dict]:
+        if not self.path.exists():
+            return []
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return []
+
+    def _save(self, items: list[dict]):
+        self.path.write_text(json.dumps(items, indent=2), encoding="utf-8")
+
+    def add_many(self, proxies: list[dict]) -> list[dict]:
+        items = self.list()
+        seen = {(p["host"], str(p["port"])) for p in items}
+        added = []
+        for pr in proxies:
+            key = (pr["host"], str(pr["port"]))
+            if key in seen:
+                continue
+            entry = {**pr, "id": uuid.uuid4().hex[:12], "status": "untested"}
+            items.append(entry)
+            seen.add(key)
+            added.append(entry)
+        self._save(items)
+        return added
+
+    def get(self, pid: str) -> Optional[dict]:
+        return next((p for p in self.list() if p.get("id") == pid), None)
+
+    def update(self, pid: str, patch: dict) -> Optional[dict]:
+        items = self.list()
+        out = None
+        for p in items:
+            if p.get("id") == pid:
+                p.update(patch)
+                out = p
+        if out:
+            self._save(items)
+        return out
+
+    def delete(self, pid: str) -> bool:
+        items = self.list()
+        kept = [p for p in items if p.get("id") != pid]
+        if len(kept) == len(items):
+            return False
+        self._save(kept)
+        return True
+
+
+def _vendor_for(renderer: str) -> str:
+    """Guess a WebGL vendor string from a renderer string's GPU family."""
+    r = (renderer or "").lower()
+    for token, name in (("nvidia", "NVIDIA"), ("radeon", "AMD"), ("amd", "AMD"),
+                        ("intel", "Intel"), ("apple", "Apple"),
+                        ("adreno", "Qualcomm"), ("qualcomm", "Qualcomm"),
+                        ("mali", "ARM"), ("arm", "ARM")):
+        if token in r:
+            return f"Google Inc. ({name})"
+    return "Google Inc."
+
+
+def _engine_webgl(os_key: str, dash_renderer: str, dash_vendor: str = "") -> tuple[str, str]:
+    """Resolve a dashboard profile's GPU into an engine WebGL vendor/renderer.
+
+    The dashboard string is passed through as-is (not remapped to the curated
+    pool), so a real GPU written by `qwerty align` survives the round-trip and
+    the profile keeps matching its browser. Only a blank renderer falls back to
+    a curated default."""
+    renderer = (dash_renderer or "").strip()
+    vendor = (dash_vendor or "").strip()
+    if not renderer:
+        return (devices.WEBGL.get(os_key) or devices.WEBGL["windows"])[0]
+    return (vendor or _vendor_for(renderer)), renderer
+
+
+def _parse_lines(raw) -> list[str]:
+    """Accept a newline-separated string (or a list) and return clean entries."""
+    if not raw:
+        return []
+    parts = raw if isinstance(raw, list) else raw.splitlines()
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _parse_startup_urls(raw) -> list[str]:
+    """Accept a newline/comma/space-separated string (or list) of URLs and
+    return a clean list, adding a scheme where one is missing."""
+    if isinstance(raw, str):
+        raw = raw.replace(",", "\n")
+    urls = []
+    for u in _parse_lines(raw):
+        if "://" not in u and not u.startswith("about:"):
+            u = "https://" + u
+        urls.append(u)
+    return urls
+
+
+def profile_fonts(os_key: str, seed: int, mode: str = "Masked") -> list[str]:
+    """The installed-font list a dashboard profile should present.
+
+    Why this is not just ``devices.FONTS[os_key]``: the installed-font list is a
+    high-entropy fingerprinting signal, and ``fingerprint.generate`` deliberately
+    samples a *subset* of the OS pool per profile ("no two machines have an
+    identical list"). Handing every dashboard profile the complete pool made them
+    all identical on this axis — and unusually complete, since a real machine
+    rarely has every font. ``collision.py`` does not compare fonts, so nothing
+    caught it.
+
+    Args:
+        os_key: engine OS key ("windows" / "macos" / "linux" / "android").
+        seed:   the profile's fingerprint seed — the same value that drives its
+                canvas/audio noise. Deriving from it keeps the font list stable
+                across saves and launches (a list that changed every launch would
+                itself be a tell) while differing between profiles.
+        mode:   the editor's Fonts setting, "Masked" or "Real". Today it never
+                reaches the engine at all.
+
+    Returns the fonts for this profile, drawn from ``devices.FONTS[os_key]``.
+    """
+    pool = list(devices.FONTS.get(os_key, []))
+    if not pool:
+        return []
+    # "Real" means present the machine's true font set, so hand back the whole
+    # pool. "Masked" (the default) presents a plausible per-profile subset.
+    if str(mode).lower() == "real":
+        return pool
+    # Mirrors fingerprint.generate()'s rule exactly, so a profile created in the
+    # dashboard is indistinguishable from one created by the CLI. Seeded from the
+    # profile's own seed, so the list is stable across saves and launches — a
+    # font list that changed every launch would itself be a tell.
+    rng = random.Random(seed)
+    return sorted(rng.sample(pool, k=max(6, len(pool) - rng.randint(0, 6))))
+
+
+def to_engine_profile(d: dict) -> Profile:
+    """Convert a stored dashboard profile dict into an engine :class:`Profile`."""
+    os_key = OS_TO_ENGINE.get(d.get("os", "Windows"), "windows")
+    is_mobile = os_key == "android"
+
+    try:
+        sw, sh = (int(x) for x in str(d.get("screen", "1920x1080")).lower().split("x"))
+    except ValueError:
+        sw, sh = 1920, 1080
+    if is_mobile:
+        vw, vh = sw, max(1, sh - 80)
+    else:
+        vw, vh = sw, max(1, sh - 88)
+
+    locale = d.get("locale", "en-US")
+    tz, langs = devices.LOCALES.get(locale, devices.LOCALES["en-US"])
+    vendor, renderer = _engine_webgl(os_key, d.get("webglRenderer", ""), d.get("webglVendor", ""))
+    # One resolved seed drives both the canvas/audio noise and the font subset,
+    # so an older profile stored with seed 0 still gets a distinct identity
+    # rather than sharing one with every other seedless profile.
+    seed = int(d.get("seed") or 0) or generate(os=os_key).seed
+
+    fp = Fingerprint(
+        os=os_key,
+        user_agent=d.get("userAgent") or "",
+        platform=devices.NAV_PLATFORM[os_key],
+        ch_platform=devices.CH_PLATFORM[os_key],
+        chrome_version=d.get("browserVersion", "128.0.0.0"),
+        screen_width=sw,
+        screen_height=sh,
+        viewport_width=vw,
+        viewport_height=vh,
+        hardware_concurrency=int(d.get("cores", 8)),
+        device_memory=int(d.get("memory", 16)),
+        fonts=profile_fonts(os_key, seed, d.get("fonts", "Masked")),
+        cameras=int(d.get("mediaVideo", 1)),
+        microphones=int(d.get("mediaAudio", 1)),
+        webgl_vendor=vendor,
+        webgl_renderer=renderer,
+        locale=locale,
+        timezone=d.get("timezone") or tz,
+        languages=langs,
+        is_mobile=is_mobile,
+        seed=seed,
+    )
+
+    proxy = None
+    px = d.get("proxy")
+    if px and px.get("host"):
+        scheme = {"HTTP": "http", "HTTPS": "http", "SOCKS5": "socks5"}.get(px.get("type", "HTTP"), "http")
+        proxy = Proxy(
+            server=f"{scheme}://{px['host']}:{px.get('port', '')}".rstrip(":"),
+            username=px.get("user") or None,
+            password=px.get("pass") or None,
+            country=px.get("country") or None,
+        )
+
+    return Profile(
+        id=d.get("id") or "unsaved",
+        name=d.get("name", "profile"),
+        fingerprint=fp,
+        proxy=proxy,
+        notes=d.get("notes", ""),
+        tags=d.get("tags", []),
+        engine=d.get("engine", "playwright"),
+        startup_urls=_parse_startup_urls(d.get("startupUrls")),
+        extensions=_parse_lines(d.get("extensions")),
+    )
+
+
+def _proxy_to_dash(proxy) -> Optional[dict]:
+    """Turn an engine Proxy into the dashboard's proxy dict."""
+    if not proxy or not proxy.server:
+        return None
+    server = proxy.server
+    scheme = "http"
+    if "://" in server:
+        scheme, server = server.split("://", 1)
+    host, _, port = server.partition(":")
+    kind = {"http": "HTTP", "https": "HTTPS", "socks5": "SOCKS5", "socks4": "SOCKS4"}.get(scheme.lower(), "HTTP")
+    return {"type": kind, "host": host, "port": port,
+            "user": proxy.username or "", "pass": proxy.password or "",
+            "country": proxy.country or ""}
+
+
+def to_dashboard_profile(prof: Profile) -> dict:
+    """Convert an engine :class:`Profile` into a dashboard-shaped dict.
+
+    The reverse of :func:`to_engine_profile` — used when the engine produces a
+    profile (an import) that the dashboard then owns and displays."""
+    fp = prof.fingerprint
+    return {
+        "name": prof.name,
+        "folder": "Facebook Ads",
+        "status": "stopped",
+        "os": OS_TO_DASH.get(fp.os, "Windows"),
+        "engine": prof.engine or "playwright",
+        "browser": "Chrome",
+        "browserVersion": fp.chrome_version,
+        "userAgent": fp.user_agent,
+        "screen": f"{fp.screen_width}x{fp.screen_height}",
+        "cores": fp.hardware_concurrency,
+        "memory": fp.device_memory,
+        "webglVendor": fp.webgl_vendor,
+        "webglRenderer": fp.webgl_renderer,
+        "canvas": "Noise", "webrtc": "Altered", "audio": "Noise", "fonts": "Masked",
+        "locale": fp.locale, "timezone": fp.timezone, "geo": "Prompt",
+        "mediaVideo": fp.cameras, "mediaAudio": fp.microphones, "dnt": False,
+        "proxy": _proxy_to_dash(prof.proxy),
+        "notes": prof.notes or "",
+        "tags": list(prof.tags),
+        "startupUrls": "\n".join(prof.startup_urls or []),
+        "extensions": "\n".join(prof.extensions or []),
+        "lastActive": "never",
+    }
+
+
+def _rel_time(ts: Optional[float]) -> str:
+    """Human 'last active' label from a unix timestamp."""
+    if not ts:
+        return "never"
+    secs = max(0.0, time.time() - ts)
+    if secs < 60:
+        return "just now"
+    mins = secs / 60
+    if mins < 60:
+        return f"{int(mins)}m ago"
+    hours = mins / 60
+    if hours < 24:
+        return f"{int(hours)}h ago"
+    return f"{int(hours / 24)}d ago"
+
+
+def dashboard_coherence(d: dict) -> list[str]:
+    """Run the real engine validator against a dashboard profile."""
+    try:
+        return validate(to_engine_profile(d).fingerprint)
+    except Exception as e:  # pragma: no cover - defensive
+        return [f"could not validate: {e}"]
+
+
+# --------------------------------------------------------------------------
+# CORS origins.
+#
+# The API binds to localhost, but "localhost only" is not the same as "safe":
+# a browser will happily send a cross-origin request from *any* page you have
+# open to http://127.0.0.1:8787. With `allow_origins=["*"]` that meant any
+# website could enumerate your profiles, read decrypted proxy passwords, launch
+# browsers or delete everything, just because the engine was running.
+#
+# So the allow-list is the dashboard's own dev/preview origins by default.
+# Override it for a custom setup with QWERTY_ALLOWED_ORIGINS (comma-separated),
+# or pass allowed_origins= to create_app().
+# --------------------------------------------------------------------------
+DASHBOARD_PORTS = (5173, 4173)   # vite dev, vite preview
+
+
+def default_origins() -> list[str]:
+    """Origins allowed to call the API when nothing else is configured."""
+    env = os.environ.get("QWERTY_ALLOWED_ORIGINS", "").strip()
+    if env:
+        return [o.strip() for o in env.split(",") if o.strip()]
+    return [f"http://{host}:{port}"
+            for port in DASHBOARD_PORTS
+            for host in ("localhost", "127.0.0.1")]
+
+
+def create_app(data_dir: Optional[str] = None, start_scheduler: bool = True,
+               allowed_origins: Optional[list[str]] = None):
+    _require_fastapi()
+    from fastapi import FastAPI, HTTPException
+    from fastapi.middleware.cors import CORSMiddleware
+
+    from .scheduler import ScheduleStore, due_schedules, next_run_at
+
+    engine_store = ProfileStore(data_dir)
+    dash = DashboardStore(engine_store.root)
+    pool = ProxyPool(engine_store.root)
+    sched = ScheduleStore(engine_store.root)
+    running: dict[str, subprocess.Popen] = {}
+    attached: dict[str, dict] = {}   # pid -> CDP connection info while attached
+
+    app = FastAPI(title="QWERTY API", version="0.1.0")
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=allowed_origins or default_origins(),
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    def is_running(pid: str) -> bool:
+        proc = running.get(pid)
+        if proc is None:
+            return False
+        if proc.poll() is not None:      # exited (browser was closed)
+            running.pop(pid, None)
+            # Session just ended — record when it was last active.
+            stored = dash.get(pid)
+            if stored is not None:
+                stored["_last_active"] = time.time()
+                log = stored.get("_activity") or []
+                log.append({"at": time.time(), "kind": "session-end", "detail": ""})
+                stored["_activity"] = log[-60:]
+                dash.save(stored)
+            return False
+        return True
+
+    def decorate(d: dict) -> dict:
+        # Attach live run state. Coherence is computed by the dashboard itself
+        # (its meter mirrors the validator), so we don't duplicate it here.
+        d = dict(d)
+        running_now = is_running(d["id"])
+        d["status"] = "running" if running_now else "stopped"
+        d["lastActive"] = "now" if running_now else _rel_time(d.get("_last_active"))
+        return d
+
+    ACTIVITY_CAP = 60          # keep the last N events per profile
+
+    def _log_activity(pid: str, kind: str, detail: str = "") -> None:
+        """Append one event to a profile's activity log (newest last), capped.
+
+        The log is a plain list on the stored profile, so it travels with the
+        profile through backup/restore and needs no separate store."""
+        d = dash.get(pid)
+        if d is None:
+            return
+        log = d.get("_activity") or []
+        log.append({"at": time.time(), "kind": kind, "detail": detail})
+        d["_activity"] = log[-ACTIVITY_CAP:]
+        dash.save(d)
+
+    @app.get("/api/health")
+    def health():
+        return {"ok": True, "version": "0.1.0"}
+
+    @app.get("/api/engines")
+    def engines():
+        from . import drivers
+        return drivers.available()
+
+    def _folder_list() -> list[str]:
+        """Every folder that exists: the ones the user created (persisted in
+        meta) plus any a profile currently lives in, de-duplicated, order kept."""
+        meta = dash.get_meta()
+        used = sorted({p.get("folder") for p in dash.list() if p.get("folder")})
+        return list(dict.fromkeys([*meta.get("folders", []), *used]))
+
+    def _persist_folders(names: list[str]) -> list[str]:
+        meta = dash.get_meta()
+        meta["folders"] = list(dict.fromkeys(n for n in names if n))
+        dash.set_meta(meta)
+        return _folder_list()
+
+    @app.get("/api/config")
+    def get_config():
+        return {
+            "default_engine": engine_store.get_default_engine(),
+            "folders": _folder_list(),
+            "root": str(engine_store.root),
+            "version": "0.1.0",
+        }
+
+    @app.put("/api/config")
+    def set_config(cfg: dict):
+        from . import drivers
+        name = cfg.get("default_engine")
+        if name is not None:
+            if name not in drivers.names():
+                raise HTTPException(400, f"unknown engine '{name}'")
+            engine_store.set_default_engine(name)
+        return get_config()
+
+    @app.post("/api/folders")
+    def create_folder(body: dict):
+        name = (body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(400, "folder name required")
+        return {"folders": _persist_folders([*_folder_list(), name])}
+
+    @app.post("/api/folders/rename")
+    def rename_folder(body: dict):
+        src = (body.get("from") or "").strip()
+        dst = (body.get("to") or "").strip()
+        if not src or not dst:
+            raise HTTPException(400, "both 'from' and 'to' are required")
+        for p in dash.list():                       # move every profile over
+            if p.get("folder") == src:
+                p["folder"] = dst
+                dash.save(p)
+        return {"folders": _persist_folders([dst if f == src else f for f in _folder_list()])}
+
+    @app.post("/api/folders/delete")
+    def delete_folder(body: dict):
+        name = (body.get("name") or "").strip()
+        reassign = (body.get("reassignTo") or "Unfiled").strip() or "Unfiled"
+        if not name:
+            raise HTTPException(400, "folder name required")
+        for p in dash.list():                       # its profiles aren't deleted
+            if p.get("folder") == name:
+                p["folder"] = reassign
+                dash.save(p)
+        return {"folders": _persist_folders([f for f in _folder_list() if f != name])}
+
+    def _remember_engine(profile: dict):
+        # "Last engine wins": the engine picked for a profile becomes the
+        # default for the next new profile.
+        eng = profile.get("engine")
+        if eng:
+            engine_store.set_default_engine(eng)
+
+    @app.get("/api/profiles")
+    def list_profiles():
+        return [decorate(p) for p in dash.list()]
+
+    @app.post("/api/profiles")
+    def create_profile(profile: dict):
+        profile.pop("_new", None)
+        profile = normalize_dashboard_profile(profile)
+        if not profile.get("engine"):
+            profile["engine"] = engine_store.get_default_engine()
+        _remember_engine(profile)
+        saved = dash.save(profile)
+        return decorate(saved)
+
+    @app.put("/api/profiles/{pid}")
+    def update_profile(pid: str, profile: dict):
+        if not dash.get(pid):
+            raise HTTPException(404, "profile not found")
+        profile["id"] = pid
+        profile.pop("_new", None)
+        profile = normalize_dashboard_profile(profile)
+        _remember_engine(profile)
+        return decorate(dash.save(profile))
+
+    @app.delete("/api/profiles/{pid}")
+    def delete_profile(pid: str):
+        if is_running(pid):
+            _stop(pid)
+        engine_store.delete(pid)
+        if not dash.delete(pid):
+            raise HTTPException(404, "profile not found")
+        sched.delete_for_profile(pid)      # never leave an unrunnable schedule
+        return {"ok": True}
+
+    def _require_engine_installed(name: str) -> None:
+        """Fail the request if the chosen engine's package isn't installed.
+
+        The launch itself runs in a subprocess, whose exit code and stderr this
+        endpoint never sees — so without this check, asking for an uninstalled
+        engine returned 200 with status "running", the child died immediately,
+        and the profile quietly flipped back to "stopped". The driver already
+        raises a message naming the missing package; surface *that* instead of
+        discarding it.
+        """
+        from . import drivers
+        try:
+            drivers.get(name)
+        except RuntimeError as e:
+            raise HTTPException(400, str(e))
+
+    @app.post("/api/profiles/{pid}/launch")
+    def launch_profile(pid: str):
+        d = dash.get(pid)
+        if not d:
+            raise HTTPException(404, "profile not found")
+        if is_running(pid):
+            return decorate(d)
+        engine_name = d.get("engine") or engine_store.get_default_engine()
+        _require_engine_installed(engine_name)
+        # Materialise a real engine profile, then open it in its own process.
+        engine_store.save(to_engine_profile(d))
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "qwerty", "--data-dir", str(engine_store.root),
+             "launch", pid],
+            stderr=subprocess.PIPE,
+        )
+        # A launch that dies this fast never opened a window — report the child's
+        # own error rather than showing a profile as running for a moment.
+        try:
+            proc.wait(timeout=1.5)
+        except subprocess.TimeoutExpired:
+            pass                        # still alive: the browser is coming up
+        else:
+            if proc.returncode != 0:
+                err = (proc.stderr.read() or b"").decode("utf-8", "replace").strip()
+                tail = err.splitlines()[-1] if err else f"exit code {proc.returncode}"
+                raise HTTPException(500, f"Launch failed: {tail}")
+        running[pid] = proc
+        _log_activity(pid, "launch", engine_name)
+        return decorate(d)
+
+    def _stop(pid: str):
+        proc = running.pop(pid, None)
+        attached.pop(pid, None)          # forget any CDP session it was serving
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+
+    @app.post("/api/profiles/{pid}/stop")
+    def stop_profile(pid: str):
+        d = dash.get(pid)
+        if not d:
+            raise HTTPException(404, "profile not found")
+        _stop(pid)
+        return decorate(d)
+
+    def _run_cli(*cli_args: str, allow_fail: bool = False) -> str:
+        """Run a qwerty subcommand in its own process (same reasoning as launch:
+        keeps sync Playwright out of the web server) and return its output.
+
+        ``allow_fail`` is for commands whose non-zero exit means "the thing you
+        asked about is unhealthy", not "the command broke" — a failing proxy test
+        still has a result worth showing.
+        """
+        proc = subprocess.run(
+            [sys.executable, "-m", "qwerty", "--data-dir", str(engine_store.root), *cli_args],
+            capture_output=True, text=True,
+        )
+        if proc.returncode != 0 and not (allow_fail and proc.stdout.strip()):
+            raise HTTPException(500, (proc.stdout + proc.stderr).strip() or "command failed")
+        return proc.stdout
+
+    def _prepare(pid: str) -> dict:
+        """Fetch a dashboard profile, refuse if its session is busy, and make sure
+        the engine-side profile exists so a subcommand can open it."""
+        d = dash.get(pid)
+        if not d:
+            raise HTTPException(404, "profile not found")
+        if is_running(pid):
+            raise HTTPException(409, "stop the profile first — its session is in use")
+        engine_store.save(to_engine_profile(d))
+        return d
+
+    @app.get("/api/profiles/{pid}/cookies")
+    def export_cookies(pid: str):
+        _prepare(pid)
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / "cookies.json"
+            _run_cli("cookies", "export", pid, str(out))
+            data = json.loads(out.read_text(encoding="utf-8"))
+        return {"cookies": data.get("cookies", [])}
+
+    @app.post("/api/profiles/{pid}/cookies")
+    def import_cookies(pid: str, body: dict):
+        _prepare(pid)
+        # Accept either parsed cookies or the raw text of a file the user picked,
+        # so the browser doesn't have to know which format it is holding.
+        raw = body.get("text")
+        if raw is None:
+            raw = json.dumps({"cookies": body.get("cookies") or []})
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "cookies.json"
+            src.write_text(raw, encoding="utf-8")
+            args = ["cookies", "import", pid, str(src)]
+            if body.get("clear"):
+                args.append("--clear")
+            _run_cli(*args)
+        n = len(cookies_mod.parse(raw))
+        _log_activity(pid, "cookies", f"imported {n}")
+        return {"ok": True, "imported": n}
+
+    @app.post("/api/profiles/{pid}/proxy-test")
+    def proxy_test(pid: str):
+        _prepare(pid)
+        # --json makes the CLI the single implementation for both front doors.
+        return json.loads(_run_cli("proxy", "test", pid, "--json", allow_fail=True))
+
+    @app.post("/api/profiles/{pid}/trust")
+    def trust(pid: str):
+        d = _prepare(pid)
+        rep = json.loads(_run_cli("trust", pid, "--json"))
+        # Remember the last grade so the Health page can show it without
+        # re-launching every profile (a trust run opens a real browser).
+        d["_trust"] = {"grade": rep.get("grade"), "score": rep.get("score"),
+                       "at": time.time()}
+        dash.save(d)
+        _log_activity(pid, "trust", f"grade {rep.get('grade', '?')}")
+        return rep
+
+    @app.post("/api/profiles/{pid}/tls")
+    def tls(pid: str):
+        _prepare(pid)
+        return json.loads(_run_cli("tls", pid, "--json", allow_fail=True))
+
+    @app.post("/api/profiles/{pid}/dns")
+    def dns(pid: str):
+        _prepare(pid)
+        return json.loads(_run_cli("dns", pid, "--json", allow_fail=True))
+
+    def _free_port() -> int:
+        """A currently-unused local TCP port for a DevTools endpoint."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    @app.post("/api/profiles/{pid}/attach")
+    def attach_profile(pid: str, body: Optional[dict] = None):
+        """Open the profile with a Chrome DevTools endpoint your own automation
+        can drive, and return the connection details.
+
+        The browser stays open — attached and 'running' — until it's stopped
+        (POST /stop), exactly like a launch. The attach itself runs as a
+        subprocess that owns the window; we read the DevTools endpoint's own
+        /json/version over HTTP to hand back the WebSocket URL. Pass
+        ``{"headless": true}`` to attach without a visible window."""
+        from .automation import CHROMIUM_ENGINES, cdp_info, snippets
+        d = dash.get(pid)
+        if not d:
+            raise HTTPException(404, "profile not found")
+        if is_running(pid):
+            info = attached.get(pid)
+            if info:
+                return info                  # already attached — idempotent
+            raise HTTPException(409, "stop the profile first — its session is in use")
+        engine = d.get("engine") or engine_store.get_default_engine()
+        if engine not in CHROMIUM_ENGINES:
+            raise HTTPException(400, f"the '{engine}' engine has no DevTools to attach "
+                                     f"to — use one of: {', '.join(CHROMIUM_ENGINES)}")
+        engine_store.save(to_engine_profile(d))
+        port = _free_port()
+        cli = [sys.executable, "-m", "qwerty", "--data-dir", str(engine_store.root),
+               "attach", pid, "--port", str(port)]
+        if (body or {}).get("headless"):
+            cli.append("--headless")
+        running[pid] = subprocess.Popen(cli)
+        try:
+            info = cdp_info(port)            # waits for DevTools to answer
+        except RuntimeError as e:
+            _stop(pid)
+            raise HTTPException(500, str(e))
+        ws = info.get("webSocketDebuggerUrl", "")
+        result = {"pid": pid, "port": port, "wsUrl": ws,
+                  "headless": bool((body or {}).get("headless")),
+                  "browser": info.get("Browser", ""), "snippets": snippets(port, ws)}
+        attached[pid] = result
+        return result
+
+    @app.post("/api/profiles/{pid}/warmup")
+    def warmup(pid: str, body: Optional[dict] = None):
+        d = _prepare(pid)
+        body = body or {}
+        minutes = float(body.get("minutes", 5))
+        cli = [sys.executable, "-m", "qwerty", "--data-dir", str(engine_store.root),
+               "warmup", pid, "--minutes", str(minutes), "--headless"]
+        if body.get("preset"):
+            cli += ["--preset", str(body["preset"])]
+        # Warm-up runs for minutes, so it goes in the background exactly like a
+        # launch — the profile shows as running and "stop" ends it.
+        running[pid] = subprocess.Popen(cli)
+        _log_activity(pid, "warmup", f"{minutes:g}m" + (f" · {body['preset']}" if body.get("preset") else ""))
+        return decorate(d)
+
+    @app.post("/api/profiles/{pid}/align")
+    def align(pid: str):
+        """Auto-adjust: rewrite the profile to match what its browser presents,
+        then write the aligned values back so the dashboard profile stays put."""
+        d = _prepare(pid)
+        res = json.loads(_run_cli("align", pid, "--json"))
+        fp = res.get("fingerprint") or {}
+        if fp.get("os"):
+            d["os"] = OS_TO_DASH.get(fp["os"], d.get("os"))
+        for src, dst in (("userAgent", "userAgent"), ("browserVersion", "browserVersion"),
+                        ("cores", "cores"), ("memory", "memory"), ("screen", "screen"),
+                        ("webglVendor", "webglVendor"), ("webglRenderer", "webglRenderer"),
+                        ("cameras", "mediaVideo"), ("microphones", "mediaAudio"),
+                        ("locale", "locale"), ("timezone", "timezone")):
+            if fp.get(src) is not None:
+                d[dst] = fp[src]
+        after = res.get("after") or {}
+        if after.get("grade"):
+            d["_trust"] = {"grade": after["grade"], "score": after.get("score"),
+                           "at": time.time()}
+        res["profile"] = decorate(dash.save(d))
+        _log_activity(pid, "align", f"grade {after.get('grade', '?')}" if after.get("grade") else "")
+        return res
+
+    @app.post("/api/profiles/{pid}/session")
+    def session_check(pid: str):
+        """Read the profile's cookie jar and report session health — how many
+        cookies are expired or expiring soon, and which logins are still live.
+        Cached as ``_session`` so the Health page can show a badge without
+        re-opening every profile."""
+        d = _prepare(pid)
+        rep = json.loads(_run_cli("session", pid, "--json"))
+        d["_session"] = {"status": rep.get("status"), "logins": rep.get("logins", []),
+                         "expired": rep.get("expired", 0),
+                         "expiringSoon": rep.get("expiringSoon", 0),
+                         "total": rep.get("total", 0), "at": time.time()}
+        dash.save(d)
+        _log_activity(pid, "session", rep.get("status", ""))
+        return rep
+
+    @app.get("/api/profiles/{pid}/activity")
+    def get_activity(pid: str):
+        """The profile's activity log, newest first."""
+        d = dash.get(pid)
+        if not d:
+            raise HTTPException(404, "profile not found")
+        return {"activity": list(reversed(d.get("_activity") or []))}
+
+    @app.post("/api/profiles/{pid}/duplicate")
+    def duplicate_profile(pid: str):
+        """Clone a profile as a template: keep the human settings (proxy, folder,
+        tags, notes, engine, startup URLs, OS + locale) but give it a *fresh
+        coherent fingerprint* so the copy is a genuinely different device — not a
+        fingerprint twin that a site could link back to the original. Runtime
+        history (trust, session, activity, run state) is dropped."""
+        src = dash.get(pid)
+        if not src:
+            raise HTTPException(404, "profile not found")
+        clone = {k: v for k, v in src.items()
+                 if not k.startswith("_") and k not in ("id", "status")}
+        clone["name"] = f"{src.get('name', 'Profile')} copy"
+        clone["status"] = "stopped"
+
+        # Re-roll the device identity so the copy doesn't collide with the source.
+        os_key = OS_TO_ENGINE.get(src.get("os", "Windows"), "windows")
+        fp = generate(os=os_key, locale=src.get("locale") or "en-US")
+        clone.update({
+            "userAgent": fp.user_agent,
+            "browserVersion": fp.chrome_version,
+            "screen": f"{fp.screen_width}x{fp.screen_height}",
+            "cores": fp.hardware_concurrency,
+            "memory": fp.device_memory,
+            "webglVendor": fp.webgl_vendor,
+            "webglRenderer": fp.webgl_renderer,
+            "mediaVideo": fp.cameras,
+            "mediaAudio": fp.microphones,
+            "seed": fp.seed,
+        })
+        saved = dash.save(clone)
+        _log_activity(saved["id"], "created", f"duplicated from {src.get('name', pid)}")
+        return decorate(saved)
+
+    @app.post("/api/profiles/batch")
+    def batch_create(body: dict):
+        """Save many dashboard profiles in one request (bulk create at scale).
+
+        The dashboard generates coherent profiles client-side and posts them in
+        chunks; this just persists them, assigning each a fresh unique id."""
+        incoming = body.get("profiles") or []
+        ids = []
+        last_engine = None
+        for p in incoming:
+            p.pop("_new", None)
+            p.pop("id", None)           # always mint a server-side id
+            if not p.get("engine"):
+                p["engine"] = engine_store.get_default_engine()
+            last_engine = p.get("engine")
+            ids.append(dash.save(p)["id"])
+        if last_engine:
+            engine_store.set_default_engine(last_engine)
+        return {"created": len(ids), "ids": ids}
+
+    @app.post("/api/profiles/bulk")
+    def bulk_update(body: dict):
+        """Apply one patch to many profiles — the dashboard's multi-select edit."""
+        ids = body.get("ids") or []
+        patch = body.get("patch") or {}
+        updated = []
+        for pid in ids:
+            d = dash.get(pid)
+            if not d:
+                continue
+            for key, value in patch.items():
+                if key == "addTags":
+                    d["tags"] = sorted({*d.get("tags", []), *value})
+                elif key == "removeTags":
+                    d["tags"] = [t for t in d.get("tags", []) if t not in value]
+                elif key == "locale":
+                    # Locale drives timezone, so move both or the profile stops
+                    # being coherent.
+                    d["locale"] = value
+                    d["timezone"] = devices.LOCALES.get(value, (d.get("timezone"), None))[0]
+                else:
+                    d[key] = value
+            _remember_engine(d)
+            updated.append(decorate(dash.save(d)))
+        return updated
+
+    @app.post("/api/fingerprint/validate")
+    def validate_fingerprint(profile: dict):
+        return {"issues": dashboard_coherence(profile)}
+
+    @app.post("/api/profiles/import")
+    def import_profiles(body: dict):
+        """Import profiles exported from GoLogin / AdsPower / Multilogin.
+
+        Runs the engine's tolerant importer, converts each result to the
+        dashboard shape and saves it, flagging any coherence issues for review."""
+        from . import importers
+        text = body.get("text") or ""
+        try:
+            raw = json.loads(text)
+        except json.JSONDecodeError:
+            raise HTTPException(400, "that file isn't valid JSON")
+        exports = importers._unwrap(raw)
+        if not exports:
+            raise HTTPException(400, "no profiles found in that file")
+        results = []
+        for exp in exports:
+            prof, issues = importers.profile_from_export(exp)
+            d = to_dashboard_profile(prof)
+            d["_new"] = True
+            _remember_engine(d)
+            dash.save(d)
+            results.append({"name": prof.name, "issues": issues})
+        return {"imported": len(results), "results": results}
+
+    # ---- Proxy pool ------------------------------------------------------
+    @app.get("/api/proxies")
+    def list_proxies():
+        return pool.list()
+
+    @app.post("/api/proxies")
+    def add_proxies(body: dict):
+        from . import proxypool as pp
+        incoming = body.get("proxies")
+        parsed = incoming if incoming else pp.parse_many(body.get("text") or "")
+        if not parsed:
+            raise HTTPException(400, "no proxies could be parsed from that input")
+        added = pool.add_many(parsed)
+        return {"added": len(added), "total": len(pool.list()), "proxies": added}
+
+    @app.delete("/api/proxies/{pid}")
+    def delete_proxy(pid: str):
+        if not pool.delete(pid):
+            raise HTTPException(404, "proxy not found")
+        return {"ok": True}
+
+    @app.post("/api/proxies/{pid}/test")
+    def test_proxy(pid: str):
+        from . import proxypool as pp
+        proxy = pool.get(pid)
+        if not proxy:
+            raise HTTPException(404, "proxy not found")
+        res = pp.check(proxy)
+        status = "ok" if res.get("ok") else ("skipped" if res.get("ok") is None else "failed")
+        pool.update(pid, {"status": status, "lastCheck": res, "checkedAt": time.time()})
+        return {**res, "status": status}
+
+    @app.post("/api/proxies/assign")
+    def assign_proxies(body: dict):
+        """Assign pool proxies across profiles, round-robin, aligning each
+        profile's locale/timezone to its proxy country."""
+        proxies = [pool.get(i) for i in body.get("proxyIds", [])] if body.get("proxyIds") else pool.list()
+        proxies = [p for p in proxies if p]
+        if not proxies:
+            raise HTTPException(400, "the proxy pool is empty")
+        ids = body.get("profileIds")
+        targets = [dash.get(i) for i in ids] if ids else dash.list()
+        targets = [t for t in targets if t]
+        assigned = 0
+        for i, prof in enumerate(targets):
+            pr = proxies[i % len(proxies)]
+            prof["proxy"] = {"type": pr.get("type", "HTTP"), "host": pr["host"], "port": str(pr["port"]),
+                             "user": pr.get("user") or "", "pass": pr.get("pass") or "",
+                             "country": pr.get("country") or ""}
+            cc = (pr.get("country") or "").upper()
+            loc = devices.COUNTRY_TO_LOCALE.get(cc)
+            if loc:
+                prof["locale"] = loc
+                prof["timezone"] = devices.LOCALES[loc][0]
+            dash.save(prof)
+            assigned += 1
+        return {"assigned": assigned, "pool": len(proxies)}
+
+    # ---- Scheduled warm-up ----------------------------------------------
+    def _spawn_warmup(pid: str, minutes: float, preset: Optional[str]) -> None:
+        """Launch a headless warm-up in the background (shared by the endpoint
+        and the scheduler). The profile shows as running until it finishes."""
+        cli = [sys.executable, "-m", "qwerty", "--data-dir", str(engine_store.root),
+               "warmup", pid, "--minutes", str(minutes), "--headless"]
+        if preset:
+            cli += ["--preset", str(preset)]
+        running[pid] = subprocess.Popen(cli)
+
+    def _decorate_schedule(s: dict) -> dict:
+        d = dash.get(s["profileId"])
+        nxt = next_run_at(s)
+        return {**s, "profileName": (d or {}).get("name", s["profileId"]),
+                "nextRun": nxt, "due": nxt <= time.time()}
+
+    @app.get("/api/schedules")
+    def list_schedules():
+        return [_decorate_schedule(s) for s in sched.list()]
+
+    @app.post("/api/schedules")
+    def add_schedule(body: dict):
+        pid = body.get("profileId")
+        if not pid or not dash.get(pid):
+            raise HTTPException(404, "profile not found")
+        entry = sched.add(profile_id=pid, every_hours=float(body.get("everyHours", 12)),
+                          minutes=float(body.get("minutes", 5)),
+                          preset=body.get("preset", "general"),
+                          enabled=bool(body.get("enabled", True)), now=time.time())
+        return _decorate_schedule(entry)
+
+    @app.put("/api/schedules/{sid}")
+    def update_schedule(sid: str, body: dict):
+        patch = {k: body[k] for k in ("everyHours", "minutes", "preset", "enabled")
+                 if k in body}
+        out = sched.update(sid, patch)
+        if not out:
+            raise HTTPException(404, "schedule not found")
+        return _decorate_schedule(out)
+
+    @app.delete("/api/schedules/{sid}")
+    def delete_schedule(sid: str):
+        if not sched.delete(sid):
+            raise HTTPException(404, "schedule not found")
+        return {"ok": True}
+
+    # ---- Fingerprint collisions -----------------------------------------
+    @app.get("/api/profiles/collisions")
+    def profiles_collisions():
+        """Profiles that share a fingerprint — a cross-account linkage risk.
+
+        Converts each stored dashboard profile to its engine fingerprint and
+        groups the ones that look like the same device."""
+        from .collision import find_collisions
+        profs = [to_engine_profile(d) for d in dash.list()]
+        return {"total": len(profs), "groups": find_collisions(profs)}
+
+    # ---- Health overview -------------------------------------------------
+    @app.get("/api/profiles/health")
+    def profiles_health():
+        """One row per profile with everything the Health page needs, computed
+        cheaply. Coherence and proxy are read straight from the stored profile;
+        the trust grade is the *cached* one from the last trust/align run (a live
+        trust check opens a real browser, too heavy to do for the whole grid)."""
+        by_profile: dict[str, dict] = {}
+        for s in sched.list():
+            # A profile keeps its most-frequent (smallest-interval) schedule row.
+            cur = by_profile.get(s["profileId"])
+            if cur is None or s.get("everyHours", 1e9) < cur.get("everyHours", 1e9):
+                by_profile[s["profileId"]] = s
+
+        profiles = dash.list()
+        # Which profiles share a fingerprint with another? (a linkage risk)
+        from .collision import find_collisions
+        colliding: set[str] = set()
+        for g in find_collisions([to_engine_profile(d) for d in profiles]):
+            colliding.update(m["id"] for m in g["members"])
+
+        rows = []
+        summary = {"total": 0, "running": 0, "coherent": 0, "withProxy": 0,
+                   "scheduled": 0, "graded": 0, "colliding": 0, "needsAttention": 0}
+        for d in profiles:
+            pid = d["id"]
+            issues = dashboard_coherence(d)
+            px = d.get("proxy") or {}
+            has_proxy = bool(px.get("host"))
+            trust = d.get("_trust")
+            sc = by_profile.get(pid)
+            run_now = is_running(pid)
+            grade = (trust or {}).get("grade")
+            collides = pid in colliding
+            # "Needs attention" = something a user would want to fix: incoherent,
+            # a known-poor trust grade, a fingerprint shared with another profile,
+            # or a session that has expired / is about to.
+            sess_status = (d.get("_session") or {}).get("status")
+            attention = (bool(issues) or (grade in ("C", "D")) or collides
+                         or sess_status in ("stale", "expiring"))
+
+            rows.append({
+                "id": pid,
+                "name": d.get("name", pid),
+                "engine": d.get("engine", "playwright"),
+                "os": d.get("os", "Windows"),
+                "status": "running" if run_now else "stopped",
+                "lastActive": "now" if run_now else _rel_time(d.get("_last_active")),
+                "coherent": not issues,
+                "issues": issues,
+                "collides": collides,
+                "proxy": {"set": has_proxy, "country": px.get("country") or None,
+                          "type": px.get("type") if has_proxy else None},
+                "trust": trust,
+                "session": d.get("_session"),
+                "schedule": ({"enabled": sc.get("enabled", True),
+                              "everyHours": sc.get("everyHours"),
+                              "preset": sc.get("preset")} if sc else None),
+                "needsAttention": attention,
+            })
+            summary["total"] += 1
+            summary["running"] += run_now
+            summary["coherent"] += not issues
+            summary["withProxy"] += has_proxy
+            summary["scheduled"] += sc is not None
+            summary["graded"] += trust is not None
+            summary["colliding"] += collides
+            summary["needsAttention"] += attention
+
+        return {"summary": summary, "profiles": rows}
+
+    def _scheduler_tick() -> None:
+        """Fire any warm-up that's due and whose profile is free right now.
+
+        A failure here must not kill the loop — but it must not be invisible
+        either. Swallowing every exception silently meant a persistently broken
+        tick looked exactly like "nothing was due", so scheduled warm-ups could
+        stop running forever with nothing to diagnose from. Each schedule is now
+        isolated (one bad profile doesn't block the rest) and every failure is
+        logged.
+        """
+        try:
+            due = due_schedules(sched.list(), time.time())
+        except Exception:
+            log.exception("scheduler: could not read schedules")
+            return
+        for s in due:
+            try:
+                pid = s["profileId"]
+                d = dash.get(pid)
+                if not d or is_running(pid):
+                    continue        # gone, or busy — try again next tick
+                engine_store.save(to_engine_profile(d))
+                _spawn_warmup(pid, s.get("minutes", 5), s.get("preset", "general"))
+                sched.mark_run(s["id"], time.time())
+            except Exception:
+                # Mark it run anyway would hide the failure; leaving it due means
+                # we retry next tick, which is right for a transient error.
+                log.exception("scheduler: schedule %s (profile %s) failed",
+                              s.get("id"), s.get("profileId"))
+
+    if start_scheduler:
+        stop = threading.Event()
+
+        def _loop():
+            while not stop.wait(60):     # check once a minute
+                _scheduler_tick()
+
+        threading.Thread(target=_loop, daemon=True, name="qwerty-scheduler").start()
+
+        @app.on_event("shutdown")
+        def _stop_scheduler():
+            stop.set()
+
+    return app
+
+
+def serve(host: str = "127.0.0.1", port: int = 8787, data_dir: Optional[str] = None,
+          allowed_origins: Optional[list[str]] = None):
+    """Start the API server (blocking)."""
+    _require_fastapi()
+    import uvicorn
+    app = create_app(data_dir, allowed_origins=allowed_origins)
+    origins = allowed_origins or default_origins()
+    print(f"QWERTY API on http://{host}:{port}  (data dir: {ProfileStore(data_dir).root})")
+    print(f"Browser origins allowed: {', '.join(origins)}")
+    uvicorn.run(app, host=host, port=port, log_level="info")
