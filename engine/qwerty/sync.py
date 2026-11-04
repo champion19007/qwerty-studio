@@ -35,6 +35,8 @@ from typing import Optional
 
 from . import crypto
 
+USER_AGENT = "qwerty-sync/0.1 (+https://github.com/champion19007/qwerty-studio)"
+
 # Fields that must never be uploaded, whatever a caller passes in. `status` and
 # `_activity` are this machine's view of a profile, not part of its identity.
 LOCAL_ONLY = ("status", "lastActive", "_activity", "_last_active", "_session", "_trust")
@@ -50,6 +52,10 @@ def _request(cfg: dict, method: str, path: str, body: Optional[dict] = None,
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("authorization", f"Bearer {cfg['token']}")
+    # urllib's default UA is "Python-urllib/3.x", which Cloudflare's browser
+    # integrity check rejects at the edge with a 403 (error 1010) before the
+    # Worker ever runs. Identify as a real client.
+    req.add_header("user-agent", USER_AGENT)
     if data:
         req.add_header("content-type", "application/json")
     try:

@@ -47,6 +47,13 @@ qwerty sync pull           # fetch and merge; --dry-run to preview
 qwerty sync status
 ```
 
+## A note on Cloudflare's own bot protection
+
+The edge runs a browser integrity check that 403s (error `1010`) any request
+whose User-Agent looks automated — including `Python-urllib/3.x`. The client
+sets a real User-Agent for exactly this reason. If you write another client,
+set one too, or you will get a 403 that never reaches the Worker.
+
 ## Conflicts
 
 Last-write-wins per profile, on the profile's own `updated_at` (unix seconds).
