@@ -1,0 +1,13 @@
+name = "qwerty-sync"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "qwerty-sync"
+database_id = "1dad0097-df9c-44ab-ab19-d87148ad9c00"
+
+# ADMIN_TOKEN is a secret, not a var — set it with:
+#   npx wrangler secret put ADMIN_TOKEN
+# It gates only /members (minting and revoking). Everything else uses the
+# per-member bearer tokens that route mints.

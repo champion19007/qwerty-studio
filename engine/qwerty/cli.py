@@ -796,6 +796,59 @@ def cmd_import_from(args, store: ProfileStore) -> int:
     return 0
 
 
+def cmd_sync(args, store: ProfileStore) -> int:
+    from .server import DashboardStore
+    from . import sync as sync_mod
+
+    dash = DashboardStore(store.root)
+    sub = args.sync_command
+
+    if sub == "login":
+        cfg = sync_mod.set_config(store, args.url, args.token)
+        try:
+            who = sync_mod.whoami(cfg)
+        except sync_mod.SyncError as e:
+            print(_c(f"Saved, but the server did not accept it: {e}", C.YEL))
+            return 1
+        print(_c(f"Signed in to {cfg['url']} as '{who.get('name')}'.", C.GRN))
+        print(_c("  Profile config syncs; browser sessions never leave this machine.", C.DIM))
+        return 0
+
+    if sub == "status":
+        st = sync_mod.status(store, dash)
+        if not st["configured"]:
+            print(_c("No remote configured.  qwerty sync login <url> <token>", C.DIM))
+            return 0
+        print(f"  remote       {st['url']}")
+        print(f"  member       {st.get('member') or _c('unknown', C.RED)}")
+        print(f"  profiles     {st['profiles']} local")
+        print(f"  cursor       {st['cursor']}")
+        if st.get("error"):
+            print(_c(f"  error        {st['error']}", C.RED))
+        if st.get("unencrypted_secrets"):
+            print(_c(f"  warning      {len(st['unencrypted_secrets'])} profile(s) have a "
+                     f"plaintext proxy password; `qwerty vault enable` before pushing.", C.YEL))
+        return 1 if st.get("error") else 0
+
+    try:
+        if sub == "push":
+            res = sync_mod.push(store, dash, dry_run=args.dry_run)
+            verb = "Would push" if args.dry_run else "Pushed"
+            print(_c(f"{verb} {res['pushed']} profile(s).", C.GRN))
+            return 0
+        if sub == "pull":
+            res = sync_mod.pull(store, dash, dry_run=args.dry_run)
+            verb = "Would apply" if args.dry_run else "Applied"
+            print(_c(f"{verb} {len(res['applied'])} profile(s); "
+                     f"{len(res['skipped'])} already current; "
+                     f"{len(res['deleted'])} removed.", C.GRN))
+            return 0
+    except sync_mod.SyncError as e:
+        print(_c(str(e), C.RED))
+        return 1
+    return 1
+
+
 def cmd_serve(args, store: ProfileStore) -> int:
     from .server import serve
     serve(host=args.host, port=args.port, data_dir=args.data_dir,
@@ -1096,6 +1149,19 @@ def build_parser() -> argparse.ArgumentParser:
     vt = c.add_subparsers(dest="vault_command", required=True)
     vt.add_parser("status", help="Show whether the vault is on, locked or unlocked").set_defaults(func=cmd_vault)
     vt.add_parser("enable", help="Turn on encryption and encrypt existing secrets").set_defaults(func=cmd_vault)
+
+    c = sub.add_parser("sync", help="Share profiles with your team over a QWERTY sync server")
+    sy = c.add_subparsers(dest="sync_command", required=True)
+    lg = sy.add_parser("login", help="Point this machine at a sync server")
+    lg.add_argument("url", help="e.g. https://qwerty-sync.<you>.workers.dev")
+    lg.add_argument("token", help="Your member token")
+    lg.set_defaults(func=cmd_sync)
+    for name, helptext in (("push", "Upload local profiles"),
+                           ("pull", "Fetch and merge remote changes")):
+        sp = sy.add_parser(name, help=helptext)
+        sp.add_argument("--dry-run", action="store_true", help="Report, change nothing")
+        sp.set_defaults(func=cmd_sync)
+    sy.add_parser("status", help="Show the configured remote and what would sync").set_defaults(func=cmd_sync)
 
     c = sub.add_parser("serve", help="Run the HTTP API for the dashboard")
     c.add_argument("--host", default="127.0.0.1")

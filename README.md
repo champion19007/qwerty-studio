@@ -52,9 +52,9 @@ what makes QWERTY distinctive.
 | **Patched-binary stealth engine** | ✅ Cloak / Camoufox | ✅ | ⚠️ | ✅ |
 | **Proxy pool + leak/DNS/TLS tests** | ✅ | partial | partial | partial |
 | **CLI + Python API** | ✅ | ❌ | limited | limited |
-| **Cloud team sync** | ❌ *(local-first by design)* | ✅ | ✅ | ✅ |
+| **Cloud team sync** | ✅ *self-hosted* | ✅ cloud | ✅ cloud | ✅ cloud |
 
-<sub>Pricing and feature comparison are approximate and based on each vendor's public plans at the time of writing — check their sites for current details. QWERTY doesn't do hosted team sync on purpose (see the roadmap); everything else is local and free.</sub>
+<sub>Pricing and feature comparison are approximate and based on each vendor's public plans at the time of writing — check their sites for current details. QWERTY's team sync is a Worker you deploy to your own Cloudflare account ([cloud/](cloud/)) — nothing is hosted for you, and it syncs profile config only, never sessions or decrypted secrets.</sub>
 
 ## What's in the box
 
@@ -293,11 +293,18 @@ stays the same manager over all of them.
 - [x] Per-profile activity log — launches, warm-ups, trust runs and session
       checks, shown as a timeline in the editor
 
+- [x] Cloud team sync (`qwerty sync`, [cloud/](cloud/)) — a Cloudflare Worker over
+      one D1 database that shares profile *config* across machines. Browser
+      sessions are deliberately not synced, and proxy passwords are encrypted by
+      the local vault before they leave, so the server stores opaque ciphertext.
+      Members are bearer tokens stored only as SHA-256; revocation is one row.
+      Self-host it yourself — nothing is hosted for you.
+
 **Next**
 
-- [ ] Cloud sync + team roles — deliberately unbuilt: it needs a hosted backend,
-      accounts and a threat model of its own. QWERTY stays local-first until
-      that's designed properly rather than bolted on.
+- [ ] Team *roles* — sync has one admin secret for minting tokens and no
+      per-member permissions beyond revocation. Roles need a real permission
+      model, not a column.
 
 Want to help? See [CONTRIBUTING.md](CONTRIBUTING.md).
 

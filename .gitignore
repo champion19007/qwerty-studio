@@ -15,3 +15,5 @@ node_modules/
 .DS_Store
 # qwerty launcher marker
 .qwerty_setup_done
+# wrangler local dev state (miniflare sqlite, bundle temp)
+.wrangler/
