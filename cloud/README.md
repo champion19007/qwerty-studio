@@ -42,10 +42,37 @@ tokens. Revoke with `DELETE /members/ahsan`; it takes effect on the next request
 
 ```bash
 qwerty sync login https://qwerty-sync.<you>.workers.dev <member-token>
-qwerty sync push           # upload this machine's profiles
+qwerty sync push           # upload profiles changed since the last push
+qwerty sync push --all     # resend everything
 qwerty sync pull           # fetch and merge; --dry-run to preview
 qwerty sync status
 ```
+
+## What it costs to run
+
+Only **D1 row reads** can realistically bind. Requests, CPU, storage and egress
+are never close — a profile is ~1 KB, so 1,000 users' 100,000 profiles occupy
+130 MB against a 5 GB allowance, and D1 has no egress charge at all.
+
+Modelled at 100 profiles per user, 10 edits/day, 4 pushes and 12 pulls:
+
+| Users | Profiles | Reads/day | Free tier? | Paid |
+|---:|---:|---:|:---:|---:|
+| 25 | 2,500 | 256,000 | yes | $5/mo |
+| 100 | 10,000 | 4.1M | yes | $5/mo |
+| 707 | 70,700 | — | at the edge | $5/mo |
+| 9,000 | 900,000 | — | no | $5/mo |
+
+`push` sends only profiles changed since the last successful push, which is
+what keeps reads linear — the server's upsert reads the existing row for every
+profile it is offered, even when its `updated_at` guard writes nothing, so a
+full push would cost one read per profile per push and scale as
+`users x pushes x profiles`. Use `qwerty sync push --all` to force a complete
+resend (a first sync, or after pointing at an empty server).
+
+Note that D1's free-tier daily limits **hard-fail** rather than throttle, and
+they are account-wide: exhausting them also breaks any other D1 you run on the
+same account.
 
 ## A note on Cloudflare's own bot protection
 

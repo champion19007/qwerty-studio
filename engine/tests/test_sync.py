@@ -151,3 +151,155 @@ def test_an_unconfigured_remote_is_refused_not_crashed(tmp_path):
     for call in (sync_mod.push, sync_mod.pull):
         with pytest.raises(sync_mod.SyncError, match="no remote configured"):
             call(store, dash)
+
+
+# --- incremental push -------------------------------------------------------
+# A full push costs one D1 row read per profile per push, even when nothing
+# changed: the server's upsert reads the existing row to evaluate its
+# updated_at guard. Across a team that is users x pushes x profiles reads a
+# day, and the pool grows with the team. These pin the watermark that avoids it.
+
+def _sent(monkeypatch):
+    """Capture the bodies push() actually puts on the wire."""
+    calls = []
+
+    def fake(cfg, method, path, body=None, timeout=30):
+        calls.append(body)
+        return {"ok": True, "pushed": len(body.get("profiles", [])), "at": 12345}
+
+    monkeypatch.setattr(sync_mod, "_request", fake)
+    return calls
+
+
+def test_a_second_push_with_no_edits_sends_nothing(tmp_path, monkeypatch):
+    store, dash = _machine(tmp_path, "m1")
+    dash.save(_profile("p1", "a", 100))
+    dash.save(_profile("p2", "b", 100))
+    sync_mod.set_config(store, "http://example.invalid", "tok")
+    calls = _sent(monkeypatch)
+
+    first = sync_mod.push(store, dash)
+    assert first["pushed"] == 2 and len(calls) == 1
+
+    second = sync_mod.push(store, dash)
+    assert second["pushed"] == 0 and second["skipped"] == 2
+    assert len(calls) == 1, "an empty push must not even make the request"
+
+
+def test_only_the_edited_profile_is_resent(tmp_path, monkeypatch):
+    store, dash = _machine(tmp_path, "m1")
+    dash.save(_profile("p1", "a", 100))
+    dash.save(_profile("p2", "b", 100))
+    sync_mod.set_config(store, "http://example.invalid", "tok")
+    calls = _sent(monkeypatch)
+    sync_mod.push(store, dash)
+
+    dash.save(_profile("p2", "b-edited", 500))
+    res = sync_mod.push(store, dash)
+
+    assert res["pushed"] == 1 and res["skipped"] == 1
+    assert [p["id"] for p in calls[-1]["profiles"]] == ["p2"]
+
+
+def test_all_forces_a_full_resend(tmp_path, monkeypatch):
+    store, dash = _machine(tmp_path, "m1")
+    dash.save(_profile("p1", "a", 100))
+    dash.save(_profile("p2", "b", 100))
+    sync_mod.set_config(store, "http://example.invalid", "tok")
+    calls = _sent(monkeypatch)
+    sync_mod.push(store, dash)
+
+    res = sync_mod.push(store, dash, everything=True)
+    assert res["pushed"] == 2
+    assert {p["id"] for p in calls[-1]["profiles"]} == {"p1", "p2"}
+
+
+def test_a_failed_push_does_not_advance_the_watermark(tmp_path, monkeypatch):
+    store, dash = _machine(tmp_path, "m1")
+    dash.save(_profile("p1", "a", 100))
+    sync_mod.set_config(store, "http://example.invalid", "tok")
+
+    def boom(*a, **k):
+        raise sync_mod.SyncError("server down")
+
+    monkeypatch.setattr(sync_mod, "_request", boom)
+    with pytest.raises(sync_mod.SyncError):
+        sync_mod.push(store, dash)
+    assert sync_mod.get_config(store).get("pushed", 0) == 0
+
+    # Once the server is back, the profile is still pending.
+    calls = _sent(monkeypatch)
+    assert sync_mod.push(store, dash)["pushed"] == 1
+    assert [p["id"] for p in calls[-1]["profiles"]] == ["p1"]
+
+
+def test_a_dry_run_does_not_advance_the_watermark(tmp_path, monkeypatch):
+    store, dash = _machine(tmp_path, "m1")
+    dash.save(_profile("p1", "a", 100))
+    sync_mod.set_config(store, "http://example.invalid", "tok")
+    calls = _sent(monkeypatch)
+
+    assert sync_mod.push(store, dash, dry_run=True)["pushed"] == 1
+    assert calls == [], "a dry run must not send anything"
+    assert sync_mod.push(store, dash)["pushed"] == 1, "still pending after a dry run"
+
+
+def test_a_pulled_profile_is_not_echoed_back(tmp_path, monkeypatch):
+    """Without this the next push returns every pulled profile to its origin."""
+    store, dash = _machine(tmp_path, "m1")
+    sync_mod.set_config(store, "http://example.invalid", "tok")
+    monkeypatch.setattr(sync_mod, "_request",
+                        lambda *a, **k: {"profiles": [_profile("remote", "r", 900)],
+                                         "deleted": [], "now": 50})
+    sync_mod.pull(store, dash)
+    assert dash.get("remote") is not None
+
+    calls = _sent(monkeypatch)
+    res = sync_mod.push(store, dash)
+    assert res["pushed"] == 0, "a just-pulled profile must not be sent straight back"
+    assert calls == []
+
+
+def test_only_outgoing_profiles_are_secret_checked(tmp_path, monkeypatch):
+    """An already-pushed plaintext secret must not block unrelated later pushes.
+
+    (It was still refused on the push that would have uploaded it — see
+    test_push_refuses_a_plaintext_proxy_password.)
+    """
+    store, dash = _machine(tmp_path, "m1")
+    sync_mod.set_config(store, "http://example.invalid", "tok")
+    _sent(monkeypatch)
+    dash.save(_profile("clean", "ok", 100))
+    sync_mod.push(store, dash)
+
+    # An old profile with a bad secret, untouched since before the watermark.
+    dash.save(_profile("legacy", "bad", 50,
+                       proxy={"host": "1.2.3.4", "port": "8080", "pass": "PLAINTEXT"}))
+    dash.save(_profile("new", "fine", 500))
+    assert sync_mod.push(store, dash)["pushed"] == 1
+
+
+def test_switching_servers_resets_the_watermark(tmp_path):
+    store, _ = _machine(tmp_path, "m1")
+    sync_mod.set_config(store, "https://a.example", "tok")
+    _save = store.get_config()
+    _save["sync"]["pushed"] = 999
+    store.save_config(_save)
+
+    assert sync_mod.set_config(store, "https://a.example", "tok2")["pushed"] == 999
+    assert sync_mod.set_config(store, "https://b.example", "tok2")["pushed"] == 0
+
+
+def test_status_counts_what_is_pending(tmp_path, monkeypatch):
+    store, dash = _machine(tmp_path, "m1")
+    dash.save(_profile("p1", "a", 100))
+    dash.save(_profile("p2", "b", 100))
+    sync_mod.set_config(store, "http://example.invalid", "tok")
+    _sent(monkeypatch)
+
+    monkeypatch.setattr(sync_mod, "whoami", lambda cfg: {"name": "me"})
+    assert sync_mod.status(store, dash)["unpushed"] == 2
+    sync_mod.push(store, dash)
+    assert sync_mod.status(store, dash)["unpushed"] == 0
+    dash.save(_profile("p2", "b2", 700))
+    assert sync_mod.status(store, dash)["unpushed"] == 1

@@ -30,7 +30,6 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
-from pathlib import Path
 from typing import Optional
 
 from . import crypto
@@ -86,8 +85,12 @@ def set_config(store, url: str, token: str) -> dict:
     existing = cfg.get("sync") if isinstance(cfg.get("sync"), dict) else {}
     # Keep the cursor when only the token is rotated, so a re-login does not
     # force a full re-pull.
+    same_server = existing.get("url") == url.rstrip("/")
     cfg["sync"] = {"url": url.rstrip("/"), "token": token,
-                   "cursor": existing.get("cursor", 0) if existing.get("url") == url.rstrip("/") else 0}
+                   "cursor": existing.get("cursor", 0) if same_server else 0,
+                   # A different server has never seen our profiles, so the push
+                   # watermark resets with the pull cursor.
+                   "pushed": existing.get("pushed", 0) if same_server else 0}
     store.save_config(cfg)
     return cfg["sync"]
 
@@ -95,6 +98,14 @@ def _save_cursor(store, cursor: int) -> None:
     cfg = store.get_config()
     if isinstance(cfg.get("sync"), dict):
         cfg["sync"]["cursor"] = int(cursor)
+        store.save_config(cfg)
+
+
+def _save_pushed(store, when: float) -> None:
+    """Remember the newest ``updated_at`` this machine has successfully pushed."""
+    cfg = store.get_config()
+    if isinstance(cfg.get("sync"), dict):
+        cfg["sync"]["pushed"] = float(when)
         store.save_config(cfg)
 
 
@@ -123,13 +134,33 @@ def whoami(cfg: dict) -> dict:
     return _request(cfg, "GET", "/whoami")
 
 
-def push(store, dash, dry_run: bool = False) -> dict:
-    """Upload every local profile. Returns a summary dict."""
+def push(store, dash, dry_run: bool = False, everything: bool = False) -> dict:
+    """Upload profiles changed since the last successful push.
+
+    Sending the whole set every time is what makes this expensive: the server's
+    upsert reads the existing row for each profile even when its ``updated_at``
+    guard writes nothing, so a full push costs one D1 row read per profile per
+    push. Across a team that is ``users x pushes x profiles`` reads a day, and
+    the profile pool grows with the team — quadratic. Filtering on a local
+    watermark collapses it to the handful of profiles actually edited.
+
+    The watermark is only advanced after the server confirms, so a failed push
+    re-sends. ``everything=True`` ignores it, for a first sync or a resync onto
+    an empty server.
+    """
     cfg = get_config(store)
     if not cfg:
         raise SyncError("no remote configured — run `qwerty sync login <url> <token>`")
 
-    profiles = [scrub(p) for p in dash.list()]
+    local = [scrub(p) for p in dash.list()]
+    since = 0.0 if everything else float(cfg.get("pushed") or 0)
+    profiles = [p for p in local if float(p.get("updated_at") or 0) > since]
+    # The newest timestamp we are about to send becomes the next watermark. Taken
+    # from the profiles themselves, not the clock, so a profile edited while the
+    # request was in flight is not skipped next time.
+    high_water = max((float(p.get("updated_at") or 0) for p in profiles), default=since)
+
+    # Only what is actually leaving needs the secret check.
     unsafe = check_secrets(profiles, store)
     if unsafe:
         raise SyncError(
@@ -138,8 +169,18 @@ def push(store, dash, dry_run: bool = False) -> dict:
             + "\nEnable the vault first (`qwerty vault enable`) so secrets are "
               "encrypted before they leave this machine.")
     if dry_run:
-        return {"ok": True, "pushed": len(profiles), "deleted": 0, "dry_run": True}
-    return _request(cfg, "POST", "/push", {"profiles": profiles, "deleted": []})
+        return {"ok": True, "pushed": len(profiles), "skipped": len(local) - len(profiles),
+                "deleted": 0, "dry_run": True}
+    if not profiles:
+        # Nothing changed: skip the request entirely rather than paying a round
+        # trip and N row reads to tell the server what it already has.
+        return {"ok": True, "pushed": 0, "skipped": len(local), "deleted": 0}
+
+    res = _request(cfg, "POST", "/push", {"profiles": profiles, "deleted": []})
+    # Only now, once the server has it.
+    _save_pushed(store, high_water)
+    res["skipped"] = len(local) - len(profiles)
+    return res
 
 
 def pull(store, dash, dry_run: bool = False) -> dict:
@@ -156,6 +197,10 @@ def pull(store, dash, dry_run: bool = False) -> dict:
     got = _request(cfg, "GET", f"/pull?since={int(cfg.get('cursor') or 0)}")
     local = {p["id"]: p for p in dash.list()}
     applied, skipped = [], []
+    # A profile we just pulled is newer than our push watermark, so without this
+    # the next push would send it straight back to the server it came from — a
+    # wasted row read per pulled profile, every time.
+    applied_high_water = float(cfg.get("pushed") or 0)
 
     for remote in got.get("profiles", []):
         pid = remote.get("id")
@@ -173,6 +218,7 @@ def pull(store, dash, dry_run: bool = False) -> dict:
                     merged[field] = mine[field]
             dash.save(merged)
         applied.append(pid)
+        applied_high_water = max(applied_high_water, float(remote.get("updated_at") or 0))
 
     removed = []
     for pid in got.get("deleted", []):
@@ -183,6 +229,8 @@ def pull(store, dash, dry_run: bool = False) -> dict:
 
     if not dry_run:
         _save_cursor(store, got.get("now", 0))
+        if applied_high_water > float(cfg.get("pushed") or 0):
+            _save_pushed(store, applied_high_water)
     return {"ok": True, "applied": applied, "skipped": skipped, "deleted": removed,
             "cursor": got.get("now", 0), "dry_run": dry_run}
 
@@ -190,12 +238,15 @@ def pull(store, dash, dry_run: bool = False) -> dict:
 def status(store, dash) -> dict:
     cfg = get_config(store)
     if not cfg:
-        return {"configured": False, "profiles": len(dash.list())}
+        return {"configured": False, "profiles": len(dash.list()), "unpushed": 0}
     out = {"configured": True, "url": cfg["url"], "cursor": cfg.get("cursor") or 0,
            "profiles": len(dash.list())}
     try:
         out["member"] = whoami(cfg).get("name")
     except SyncError as e:
         out["error"] = str(e)
-    out["unencrypted_secrets"] = check_secrets([scrub(p) for p in dash.list()], store)
+    local = [scrub(p) for p in dash.list()]
+    out["unencrypted_secrets"] = check_secrets(local, store)
+    since = float(cfg.get("pushed") or 0)
+    out["unpushed"] = sum(1 for p in local if float(p.get("updated_at") or 0) > since)
     return out

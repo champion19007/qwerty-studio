@@ -823,6 +823,7 @@ def cmd_sync(args, store: ProfileStore) -> int:
         print(f"  member       {st.get('member') or _c('unknown', C.RED)}")
         print(f"  profiles     {st['profiles']} local")
         print(f"  cursor       {st['cursor']}")
+        print(f"  unpushed     {st['unpushed']} profile(s) changed since the last push")
         if st.get("error"):
             print(_c(f"  error        {st['error']}", C.RED))
         if st.get("unencrypted_secrets"):
@@ -832,9 +833,13 @@ def cmd_sync(args, store: ProfileStore) -> int:
 
     try:
         if sub == "push":
-            res = sync_mod.push(store, dash, dry_run=args.dry_run)
+            res = sync_mod.push(store, dash, dry_run=args.dry_run,
+                                everything=getattr(args, "all", False))
             verb = "Would push" if args.dry_run else "Pushed"
             print(_c(f"{verb} {res['pushed']} profile(s).", C.GRN))
+            if res.get("skipped"):
+                print(_c(f"  {res['skipped']} unchanged since the last push "
+                         f"(--all to resend everything).", C.DIM))
             return 0
         if sub == "pull":
             res = sync_mod.pull(store, dash, dry_run=args.dry_run)
@@ -1160,6 +1165,10 @@ def build_parser() -> argparse.ArgumentParser:
                            ("pull", "Fetch and merge remote changes")):
         sp = sy.add_parser(name, help=helptext)
         sp.add_argument("--dry-run", action="store_true", help="Report, change nothing")
+        if name == "push":
+            sp.add_argument("--all", action="store_true",
+                            help="Resend every profile, not just those changed "
+                                 "since the last push")
         sp.set_defaults(func=cmd_sync)
     sy.add_parser("status", help="Show the configured remote and what would sync").set_defaults(func=cmd_sync)
 
