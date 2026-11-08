@@ -94,6 +94,7 @@ qwerty-studio/
 | 🔌 **Pluggable engines** | Swap the stealth backend: CloakBrowser, Camoufox, Patchright, Playwright |
 | 🔗 **Startup URLs** | Each profile opens the pages you want, in its own tabs |
 | 🖱️ **One-click launcher** | `start.bat` installs everything and starts both halves on Windows |
+| 🔄 **Team sync** | Share profile config across machines via a Cloudflare Worker you own — sessions and decrypted secrets never leave |
 | ⌨️ **CLI + Python API** | Script it or drive it by hand |
 
 > **Mobile profiles are early.** `ANDROID_DEVICES` currently holds 6 real
@@ -173,8 +174,58 @@ qwerty serve                    # HTTP API on http://localhost:8787
 Leave `qwerty serve` running and start the dashboard (`npm run dev`) in a second
 terminal. That's it — clicking ▶ launches the profile for real.
 
+### 4. Team sync (optional)
+
+Share profiles between your own machines, or with a team. You host it: the
+server is a Cloudflare Worker in **your** account, and nothing is hosted for you.
+Free for a small team — see [cloud/README.md](cloud/README.md) for the cost model.
+
+**What crosses the wire:** profile config only. Browser sessions (cookies,
+`localStorage`) are never uploaded, and proxy passwords are encrypted by your
+local vault first, so the server stores ciphertext it cannot read. Enable the
+vault before your first push:
+
+```bash
+qwerty vault enable
+```
+
+**Deploy the server once:**
+
+```bash
+cd cloud
+npx wrangler d1 create qwerty-sync                            # put the id in wrangler.toml
+npx wrangler d1 execute qwerty-sync --remote --file=schema.sql
+npx wrangler secret put ADMIN_TOKEN                           # any long random string
+npx wrangler deploy
+```
+
+**Mint a token per person** (the admin token only does this; it is never used
+by the client):
+
+```bash
+curl -X POST https://qwerty-sync.<you>.workers.dev/members   -H "authorization: Bearer $ADMIN_TOKEN"   -H 'content-type: application/json' -d '{"name":"ahsan"}'
+```
+
+The token is shown once — only its SHA-256 is stored. Revoke with
+`DELETE /members/ahsan`, effective on the next request.
+
+**Then on each machine:**
+
+```bash
+qwerty sync login https://qwerty-sync.<you>.workers.dev <member-token>
+qwerty sync push           # send profiles changed since your last push
+qwerty sync pull           # fetch and merge; --dry-run to preview
+qwerty sync status         # remote, member, and what is pending
+```
+
+Conflicts are last-write-wins on each profile's own `updated_at`: a pull never
+overwrites a local profile that is newer, and a push never overwrites a newer
+remote one. Teammates share the vault master password out of band — it is not
+uploaded, and without it their copy of a synced proxy password stays encrypted.
+
 Full details live in each part's README:
-[engine/README.md](engine/README.md) · [dashboard/README.md](dashboard/README.md).
+[engine/README.md](engine/README.md) · [dashboard/README.md](dashboard/README.md) ·
+[cloud/README.md](cloud/README.md).
 
 ## How it works
 
